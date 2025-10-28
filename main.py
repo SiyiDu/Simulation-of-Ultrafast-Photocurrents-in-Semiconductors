@@ -5,6 +5,14 @@ import scipy.constants as const
 from scipy.optimize import curve_fit
 from tqdm import tqdm
 
+from shared_solver import (
+    BoundaryCondition,
+    apply_boundary_conditions,
+    compute_current_density,
+    compute_legacy_charge,
+    integrate_current_trace,
+)
+
 kB = const.Boltzmann
 q = const.e
 h = const.h
@@ -74,10 +82,18 @@ for V in voltage_range:
     n1 = npu0 * gaussian(x_range, xpu)
     n += n1
 
-    n[0] = n0
-    n[-1] = n0
+    boundary_condition = BoundaryCondition(
+        kind="dirichlet",
+        value=(n0, n0),
+        reason=(
+            "Contacts are assumed to pin the carrier density to the thermal "
+            "equilibrium value, enforcing a Dirichlet boundary condition."
+        ),
+    )
 
+    baseline_bc_log = {}
     J_values = []
+    legacy_J_values = []
     for t in range(Nt):
         nprime = (np.roll(n, -1) - np.roll(n, 1)) / (2 * dx)
         dif = (np.roll(diffusion(n), -1) - np.roll(diffusion(n), 1)) / (2 * dx)
@@ -88,11 +104,21 @@ for V in voltage_range:
         dnx = (dif + driE - rec) * dt
         n += dnx
 
-        # J = -diffusion(n)[JP] - (n[JP]-n0) * mb * E
-        J = dnx[0]
+        baseline_bc_log = apply_boundary_conditions(
+            n, boundary_condition, dx, record=baseline_bc_log
+        )
+        J = compute_current_density(n, E, mb, D(n), dx)
         J_values.append(J)
+        legacy_J_values.append(dnx[0])
 
-    Q_avg0 = 1.6e-19 * np.mean(J_values) * 1.25e-8
+    Q_avg0 = integrate_current_trace(J_values, dt)
+    legacy_Q_avg0 = compute_legacy_charge(legacy_J_values, t_max)
+    print(
+        f"Applied {baseline_bc_log['type']} boundary condition because {baseline_bc_log['reason']}"
+    )
+    print(
+        f"Baseline charge: legacy={legacy_Q_avg0:.3e} C, drift-diffusion={Q_avg0:.3e} C"
+    )
     # Loop over different td values
     loop = 0
     td_left = []
@@ -111,8 +137,8 @@ for V in voltage_range:
         n += n1st
 
         J_values = []
-        t_values = []
-
+        legacy_J_values = []
+        td_bc_log = {}
 
         for t in range(Nt):
             if t == int(abs(td) / dt):
@@ -127,23 +153,28 @@ for V in voltage_range:
             dnx = (dif + driE - rec) * dt
             n += dnx
 
-            # J = -diffusion(n)[JP] - (n[JP]-n0) * mb * E
-            J = dnx[0]
+            td_bc_log = apply_boundary_conditions(n, boundary_condition, dx, record=td_bc_log)
+            J = compute_current_density(n, E, mb, D(n), dx)
             J_values.append(J)
-            t_values.append(t * dt)
-
-            n[0] = n0
-            n[-1] = n0
+            legacy_J_values.append(dnx[0])
 
             iteration += 1
             """if t%250 == 0:
                plt.plot(x_range,n)
                plt.show
 """
-        Q_avg = 1.6e-19 * np.mean(J_values) * 1.25e-8 - Q_avg0
-        Q_avg *= 1e9
-        Q_values.append(Q_avg)
-        print("# of charges collected: ", dnx[0], "current is ", Q_avg)
+        Q_total = integrate_current_trace(J_values, dt)
+        legacy_Q_total = compute_legacy_charge(legacy_J_values, t_max)
+        delta_Q = (Q_total - Q_avg0) * 1e9
+        Q_values.append(delta_Q)
+        print(
+            "# of charges collected (legacy vs new): ",
+            f"{legacy_Q_total:.3e} C -> {Q_total:.3e} C",
+        )
+        if td == td_values[0]:
+            print(
+                f"First delay boundary condition: {td_bc_log['type']} (reason: {td_bc_log['reason']})"
+            )
         # print("del # of charges at end: ", dnx[JP])
         # print("# of charges at end: ", n[150])
 
@@ -164,8 +195,8 @@ for V in voltage_range:
 
 # Finalize plot
 plt.xlabel('td (ns)')
-plt.ylabel('PC(nA)')
-plt.title(f'PC vs td for different V values(k1={k1}, k2={k2}, n0={n0:.1e}, mb={mb})')
+plt.ylabel('ΔQ (nC)')
+plt.title(f'ΔQ vs td for different V values(k1={k1}, k2={k2}, n0={n0:.1e}, mb={mb})')
 plt.legend()
 plt.grid(True)
 plt.show()

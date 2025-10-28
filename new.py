@@ -5,6 +5,11 @@ import scipy.constants as const
 from scipy.optimize import curve_fit
 from tqdm import tqdm
 
+from shared_solver import (
+    BoundaryCondition,
+    apply_boundary_conditions,
+)
+
 kB = const.Boltzmann
 q = const.e
 h = const.h
@@ -89,11 +94,26 @@ for V in voltage_range:
     n = n_initial.copy()
     n1 = npu0 * gaussian(x_range, xpu)
     n += n1
+    boundary_condition = BoundaryCondition(
+        kind="dirichlet",
+        value=(n0, n0),
+        reason=(
+            "Contacts are assumed to pin the carrier density to the thermal "
+            "equilibrium value, enforcing a Dirichlet boundary condition."
+        ),
+    )
+    baseline_bc_log = {}
     n[0] = n0
     n[-1] = n0
+    baseline_bc_log = apply_boundary_conditions(
+        n, boundary_condition, dx, record=baseline_bc_log
+    )
 
     # Loop over different td values
     loop = 0
+    print(
+        f"Applied {baseline_bc_log['type']} boundary condition because {baseline_bc_log['reason']}"
+    )
     for td in tqdm(td_values, desc=f"Processing td values for V={V}", colour="green"):
         iteration = 1
         n = n_initial.copy()
@@ -106,11 +126,12 @@ for V in voltage_range:
             n1st = n2
             n2nd = n1
         n += n1st
+        td_bc_log = {}
         for t in range(Nt):
             if t == int(abs(td) / dt):
                 n += n2nd
-            Ef=compute_total_field(n)
-            Etotal=E+Ef
+            Ef = compute_total_field(n)
+            Etotal = E + Ef
             nprime = (np.roll(n, -1) - np.roll(n, 1)) / (2 * dx)
             dif = (np.roll(diffusion(n), -1) - np.roll(diffusion(n), 1)) / (2 * dx)
             driE = (np.roll(drift(n, E), -1) - np.roll(drift(n, E), 0)) / dx
@@ -120,15 +141,19 @@ for V in voltage_range:
             dnx = (dif + driE - rec) * dt
             n += dnx
 
-            n[0] = n0
-            n[-1] = n0
+            td_bc_log = apply_boundary_conditions(
+                n, boundary_condition, dx, record=td_bc_log
+            )
             p = n[::-1]
             iteration += 1
 
-
-            if t%50 == 0:
-               plt.plot(x_range,n)
-               plt.plot(x_range, p)
-               plt.plot(x_range, Etotal)
-               #plt.ylim(0.4e18, 1e18)
-               plt.show()
+            if t % 50 == 0:
+                plt.plot(x_range, n)
+                plt.plot(x_range, p)
+                plt.plot(x_range, Etotal)
+                # plt.ylim(0.4e18, 1e18)
+                plt.show()
+        if td == td_values[0]:
+            print(
+                f"First delay boundary condition: {td_bc_log['type']} (reason: {td_bc_log['reason']})"
+            )
