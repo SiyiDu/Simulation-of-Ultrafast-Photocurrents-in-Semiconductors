@@ -1,168 +1,398 @@
-import time
+"""Core simulation routines for ultrafast photocurrent calculations.
+
+This module implements a one-dimensional drift-diffusion simulation with a
+self-consistent electric field obtained from Poisson's equation.  It separates
+electron and hole densities explicitly and provides optional diagnostics for
+saving intermediate fields or enabling debug output.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+
 import numpy as np
-import matplotlib.pyplot as plt
 import scipy.constants as const
-from scipy.optimize import curve_fit
-from tqdm import tqdm
 
-kB = const.Boltzmann
-q = const.e
-h = const.h
-c = const.c
-PulsePower1st = 1
-
-n0 = 5e17
-# D0 = 0.26  # to be confirmed
-k1 = 14e7
-k2 = 5e-9
-k3 = 1e-30
-L = 1e-3
-a = 0  # D modifier: not doing a lot at the moment
-mb = 100
-
-npu0 = 70e17
-npr0 = 5e17
-T = 10
-
-t0 = 3e-11
-t_max = 1.25e-8
-dt = 1e-12
-dx = 0.5e-5
-xpu = 5e-4
-xpr = 5e-4
-w = 2e-4
-JP = 1
-
-voltage_range = range(4, 8, 1)
-
-x_range = np.arange(0, L + dx, dx)
-dnx = np.zeros(len(x_range))
-n_initial = np.zeros(len(x_range)) + n0
-Nt = int(t_max / dt)
-
-# Lists to store Q_trapz values and td values
-td_values = np.arange(-0.5e-9, 0.51e-9, 0.05e-9)
+try:  # Optional dependency used only when plotting is requested explicitly.
+    import matplotlib.pyplot as plt
+except ImportError:  # pragma: no cover - plotting is optional.
+    plt = None
 
 
-def D(n):
-    return mb * kB * T / q * (n0 ** a) / np.power(n, a)
+@dataclass
+class SimulationParameters:
+    """Physical and numerical parameters for the simulation."""
+
+    length: float = 1.0e-3
+    dx: float = 0.5e-5
+    dt: float = 1.0e-12
+    t_max: float = 1.25e-8
+    temperature: float = 300.0  # Kelvin
+    mobility_e: float = 300.0
+    mobility_h: float = 150.0
+    n0: float = 5.0e17
+    p0: float = 5.0e17
+    k1: float = 14.0e7
+    k2: float = 5.0e-9
+    k3: float = 1.0e-30
+    epsilon_r: float = 12.9
+    pulse_width: float = 2.0e-4
+    npu0: float = 70.0e17
+    npr0: float = 5.0e17
+    xpu: float = 5.0e-4
+    xpr: float = 5.0e-4
+
+    @property
+    def x_range(self) -> np.ndarray:
+        return np.arange(0.0, self.length + self.dx, self.dx)
+
+    @property
+    def num_steps(self) -> int:
+        return int(self.t_max / self.dt)
 
 
-def diffusion(n):
-    return D(n) * (np.roll(n, -1) - np.roll(n, 1)) / (2 * dx)
+@dataclass
+class DiagnosticConfig:
+    """Configuration flags controlling optional diagnostic output."""
+
+    enable_progress: bool = True
+    enable_plots: bool = False
+    save_fields: bool = False
+    field_stride: int = 50
+    field_output_dir: Path = Path("diagnostics")
+    debug_interval: Optional[int] = None
+    debug_enabled: bool = False
+
+    def maybe_save_fields(
+        self,
+        identifier: str,
+        step: int,
+        phi: np.ndarray,
+        electric_field: np.ndarray,
+        charge_density: np.ndarray,
+        n_e: np.ndarray,
+        p_h: np.ndarray,
+    ) -> None:
+        if not self.save_fields or step % self.field_stride != 0:
+            return
+
+        self.field_output_dir.mkdir(parents=True, exist_ok=True)
+        np.savez(
+            self.field_output_dir / f"{identifier}_step{step:06d}.npz",
+            phi=phi,
+            electric_field=electric_field,
+            charge_density=charge_density,
+            electrons=n_e,
+            holes=p_h,
+        )
+
+    def maybe_debug(self, message: str, step: int) -> None:
+        if self.debug_enabled and self.debug_interval and step % self.debug_interval == 0:
+            print(f"[step {step}] {message}")
 
 
-def drift(n, E):
-    # return (n-n0) * mb * E
-    return n * mb * E
+def gaussian(x: np.ndarray, center: float, width: float) -> np.ndarray:
+    return np.exp(-np.square((x - center) / width))
 
 
-def gaussian(x, x_0, w=1e-4):
-    return np.exp(-1 * np.square((x - x_0) / w))
+def thomas_algorithm(a: np.ndarray, b: np.ndarray, c: np.ndarray, d: np.ndarray) -> np.ndarray:
+    """Solve a tridiagonal system using the Thomas algorithm."""
+
+    nf = len(d)  # number of equations
+    ac, bc, cc, dc = map(np.array, (a, b, c, d))
+    for it in range(1, nf):
+        mc = ac[it - 1] / bc[it - 1]
+        bc[it] = bc[it] - mc * cc[it - 1]
+        dc[it] = dc[it] - mc * dc[it - 1]
+
+    xc = bc
+    xc[-1] = dc[-1] / bc[-1]
+
+    for il in range(nf - 2, -1, -1):
+        xc[il] = (dc[il] - cc[il] * xc[il + 1]) / bc[il]
+
+    return xc
 
 
-def expo(x, a, b, t):
-    return a + b * np.exp(x / t)
+def solve_poisson_dirichlet(
+    charge_density: np.ndarray,
+    dx: float,
+    epsilon_r: float,
+    phi_left: float,
+    phi_right: float,
+) -> np.ndarray:
+    """Solve 1D Poisson equation with Dirichlet boundary conditions."""
+
+    n = charge_density.size
+    if n < 3:
+        raise ValueError("Poisson solver requires at least 3 spatial points")
+
+    eps = const.epsilon_0 * epsilon_r
+    scale = -dx * dx / eps
+
+    a = np.ones(n - 3)
+    b = -2.0 * np.ones(n - 2)
+    c = np.ones(n - 3)
+    d = scale * charge_density[1:-1]
+    d[0] -= phi_left
+    d[-1] -= phi_right
+
+    phi = np.zeros_like(charge_density)
+    phi[0] = phi_left
+    phi[-1] = phi_right
+    phi[1:-1] = thomas_algorithm(a, b, c, d)
+    return phi
 
 
-# Loop over voltage values and td values to calculate Q_avg - Q_avg0
-for V in voltage_range:
-    E = V / L
-    Q_values = []
-    n = n_initial.copy()
-    n1 = npu0 * gaussian(x_range, xpu)
-    n += n1
+def compute_electric_field(phi: np.ndarray, dx: float) -> np.ndarray:
+    return -np.gradient(phi, dx, edge_order=2)
 
-    n[0] = n0
-    n[-1] = n0
 
-    J_values = []
-    for t in range(Nt):
-        nprime = (np.roll(n, -1) - np.roll(n, 1)) / (2 * dx)
-        dif = (np.roll(diffusion(n), -1) - np.roll(diffusion(n), 1)) / (2 * dx)
-        driE = (np.roll(drift(n, E), -1) - np.roll(drift(n, E), 0)) / dx
-        # rec = k1 * (n - n0) + k2 * (n ** 2 - n0 ** 2)
-        rec = k1 * (n - n0) + k2 * n * (n - n0) + k3 * n * n * (n - n0)
+def diffusion_coefficient(mobility: float, temperature: float) -> float:
+    return mobility * const.Boltzmann * temperature / const.e
 
-        dnx = (dif + driE - rec) * dt
-        n += dnx
 
-        # J = -diffusion(n)[JP] - (n[JP]-n0) * mb * E
-        J = dnx[0]
-        J_values.append(J)
+def carrier_current_density(
+    density: np.ndarray,
+    mobility: float,
+    electric_field: np.ndarray,
+    diffusion_coeff: float,
+    dx: float,
+    sign: float,
+) -> np.ndarray:
+    grad_density = np.gradient(density, dx, edge_order=2)
+    drift_term = mobility * density * electric_field
+    diffusion_term = diffusion_coeff * grad_density
+    return sign * const.e * (drift_term + diffusion_term)
 
-    Q_avg0 = 1.6e-19 * np.mean(J_values) * 1.25e-8
-    # Loop over different td values
-    loop = 0
-    for td in tqdm(td_values, desc=f"Processing td values for V={V}", colour="green"):
-        iteration = 1
-        n = n_initial.copy()
-        n1 = npu0 * gaussian(x_range, xpu)
-        n2 = npr0 * gaussian(x_range, xpr)
-        if td > 0:
-            n1st = n1
-            n2nd = n2
+
+def recombination_rate(
+    n_e: np.ndarray,
+    p_h: np.ndarray,
+    params: SimulationParameters,
+) -> np.ndarray:
+    avg_density = 0.5 * (n_e + p_h)
+    excess = avg_density - params.n0
+    return (
+        params.k1 * excess
+        + params.k2 * avg_density * excess
+        + params.k3 * np.square(avg_density) * excess
+    )
+
+
+def build_pulse_profiles(params: SimulationParameters) -> Tuple[np.ndarray, np.ndarray]:
+    x = params.x_range
+    pump_profile = params.npu0 * gaussian(x, params.xpu, params.pulse_width)
+    probe_profile = params.npr0 * gaussian(x, params.xpr, params.pulse_width)
+    return pump_profile, probe_profile
+
+
+def evolve_system(
+    voltage: float,
+    pulse_schedule: Sequence[Tuple[int, np.ndarray, np.ndarray]],
+    params: SimulationParameters,
+    diagnostics: DiagnosticConfig,
+    identifier: str,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    x = params.x_range
+    n_e = np.full_like(x, params.n0, dtype=float)
+    p_h = np.full_like(x, params.p0, dtype=float)
+
+    schedule = sorted(list(pulse_schedule), key=lambda item: item[0])
+    schedule_index = 0
+
+    diffusion_e = diffusion_coefficient(params.mobility_e, params.temperature)
+    diffusion_h = diffusion_coefficient(params.mobility_h, params.temperature)
+
+    j_history = np.zeros(params.num_steps, dtype=float)
+
+    for step in range(params.num_steps):
+        while schedule_index < len(schedule) and schedule[schedule_index][0] == step:
+            _, pulse_e, pulse_h = schedule[schedule_index]
+            n_e += pulse_e
+            p_h += pulse_h
+            schedule_index += 1
+
+        charge_density = const.e * (
+            (p_h - n_e) + (params.p0 - params.n0)
+        )
+        phi = solve_poisson_dirichlet(
+            charge_density,
+            params.dx,
+            params.epsilon_r,
+            phi_left=0.0,
+            phi_right=voltage,
+        )
+        electric_field = compute_electric_field(phi, params.dx)
+
+        j_e = carrier_current_density(
+            n_e,
+            params.mobility_e,
+            electric_field,
+            diffusion_e,
+            params.dx,
+            sign=-1.0,
+        )
+        j_h = carrier_current_density(
+            p_h,
+            params.mobility_h,
+            electric_field,
+            diffusion_h,
+            params.dx,
+            sign=1.0,
+        )
+
+        recomb = recombination_rate(n_e, p_h, params)
+        dn_dt = -np.gradient(j_e, params.dx, edge_order=2) / const.e - recomb
+        dp_dt = -np.gradient(j_h, params.dx, edge_order=2) / const.e - recomb
+
+        n_e[1:-1] += params.dt * dn_dt[1:-1]
+        p_h[1:-1] += params.dt * dp_dt[1:-1]
+
+        n_e = np.clip(n_e, 0.0, None)
+        p_h = np.clip(p_h, 0.0, None)
+
+        n_e[0] = params.n0
+        n_e[-1] = params.n0
+        p_h[0] = params.p0
+        p_h[-1] = params.p0
+
+        j_history[step] = j_e[0] + j_h[0]
+
+        diagnostics.maybe_save_fields(
+            identifier,
+            step,
+            phi,
+            electric_field,
+            charge_density,
+            n_e,
+            p_h,
+        )
+        diagnostics.maybe_debug(
+            f"Contact current density = {j_history[step]:.3e} A/m^2",
+            step,
+        )
+
+    return j_history, n_e, p_h
+
+
+def integrate_current(current_trace: np.ndarray, dt: float) -> float:
+    total_charge_density = np.trapz(current_trace, dx=dt)
+    average_current = total_charge_density / (current_trace.size * dt)
+    return average_current * 1e9  # Convert to nA assuming unit area.
+
+
+def build_pulse_schedule(
+    td: float,
+    params: SimulationParameters,
+    pump_profile: np.ndarray,
+    probe_profile: np.ndarray,
+) -> List[Tuple[int, np.ndarray, np.ndarray]]:
+    delay_steps = int(round(abs(td) / params.dt))
+
+    pump = (pump_profile.copy(), pump_profile.copy())
+    probe = (probe_profile.copy(), probe_profile.copy())
+
+    if td >= 0:
+        schedule = [(0, pump[0], pump[1])]
+        if delay_steps > 0:
+            schedule.append((delay_steps, probe[0], probe[1]))
         else:
-            n1st = n2
-            n2nd = n1
-        n += n1st
+            schedule[0] = (
+                0,
+                pump[0] + probe[0],
+                pump[1] + probe[1],
+            )
+    else:
+        schedule = [(0, probe[0], probe[1])]
+        if delay_steps > 0:
+            schedule.append((delay_steps, pump[0], pump[1]))
+        else:
+            schedule[0] = (
+                0,
+                probe[0] + pump[0],
+                probe[1] + pump[1],
+            )
 
-        J_values = []
-        t_values = []
-        td_left = []
-        Q_left = []
+    return schedule
 
-        for t in range(Nt):
-            if t == int(abs(td) / dt):
-                n += n2nd
 
-            nprime = (np.roll(n, -1) - np.roll(n, 1)) / (2 * dx)
-            dif = (np.roll(diffusion(n), -1) - np.roll(diffusion(n), 1)) / (2 * dx)
-            driE = (np.roll(drift(n, E), -1) - np.roll(drift(n, E), 0)) / dx
-            # rec = k1 * (n - n0) + k2 * (n ** 2 - n0 ** 2)
-            rec = k1 * (n - n0) + k2 * n * (n - n0) + k3 * n * n * (n - n0)
+def run_simulation(
+    voltages: Iterable[float],
+    td_values: Sequence[float],
+    params: Optional[SimulationParameters] = None,
+    diagnostics: Optional[DiagnosticConfig] = None,
+) -> Dict[float, Tuple[np.ndarray, np.ndarray]]:
+    params = params or SimulationParameters()
+    diagnostics = diagnostics or DiagnosticConfig()
 
-            dnx = (dif + driE - rec) * dt
-            n += dnx
+    pump_profile, probe_profile = build_pulse_profiles(params)
+    td_array = np.asarray(td_values, dtype=float)
 
-            # J = -diffusion(n)[JP] - (n[JP]-n0) * mb * E
-            J = dnx[0]
-            J_values.append(J)
-            t_values.append(t * dt)
+    results: Dict[float, Tuple[np.ndarray, np.ndarray]] = {}
 
-            n[0] = n0
-            n[-1] = n0
+    for voltage in voltages:
+        base_schedule = [(0, pump_profile.copy(), pump_profile.copy())]
+        base_trace, _, _ = evolve_system(
+            voltage,
+            base_schedule,
+            params,
+            diagnostics,
+            identifier=f"V{voltage:.2f}_baseline",
+        )
+        q_baseline = integrate_current(base_trace, params.dt)
 
-            iteration += 1
-            if t%250 == 0:
-               plt.plot(x_range,n)
-               plt.show()
+        q_values = np.zeros_like(td_array)
 
-        Q_avg = 1.6e-19 * np.mean(J_values) * 1.25e-8 - Q_avg0
-        Q_avg *= 1e9
-        Q_values.append(Q_avg)
-        # print("del # of charges at end: ", dnx[JP])
-        # print("# of charges at end: ", n[150])
-        """
-        if loop == 16:
-            Q_left = Q_values.copy()
-            td_left = td_values[:17]
-            print(td_left, Q_left)
-        loop+=1
-    bounds_left = ([-np.inf, -np.inf, 0],
-                   [np.inf, 0, np.inf])
-    popt_left, pcov_left = curve_fit(expo, td_left, Q_left, bounds=bounds_left)
-    # Plot Q/td curve for current V value
-    print(popt_left)
-    plt.plot(td_left, expo(td_left, *popt_left), label='curve', color='red')
-    """
-    plt.plot(td_values, Q_values, marker='o', label=f'V={V}V')
-    # plt.show()
+        td_iterable: Iterable[float]
+        if diagnostics.enable_progress:
+            from tqdm import tqdm
 
-# Finalize plot
-plt.xlabel('td (ns)')
-plt.ylabel('PC(nA)')
-plt.title(f'PC vs td for different V values(k1={k1}, k2={k2}, n0={n0:.1e}, mb={mb})')
-plt.legend()
-plt.grid(True)
-plt.show()
+            td_iterable = tqdm(td_array, desc=f"V={voltage} V", colour="green")
+        else:
+            td_iterable = td_array
+
+        for index, td in enumerate(td_iterable):
+            schedule = build_pulse_schedule(td, params, pump_profile, probe_profile)
+            trace, _, _ = evolve_system(
+                voltage,
+                schedule,
+                params,
+                diagnostics,
+                identifier=f"V{voltage:.2f}_td{td:+.2e}",
+            )
+            q_values[index] = integrate_current(trace, params.dt) - q_baseline
+
+        results[voltage] = (td_array.copy(), q_values)
+
+    return results
+
+
+def plot_results(results: Dict[float, Tuple[np.ndarray, np.ndarray]]) -> None:
+    if plt is None:
+        raise RuntimeError("matplotlib is required for plotting diagnostics")
+
+    for voltage, (tds, currents) in results.items():
+        plt.plot(tds * 1e9, currents, marker="o", label=f"V = {voltage} V")
+
+    plt.xlabel("td (ns)")
+    plt.ylabel("Average current (nA)")
+    plt.title("Photocurrent vs. pump-probe delay")
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+
+if __name__ == "__main__":
+    default_params = SimulationParameters()
+    td_values = np.arange(-0.5e-9, 0.51e-9, 0.05e-9)
+    voltage_range = range(4, 8, 1)
+
+    diagnostics = DiagnosticConfig(enable_progress=True, enable_plots=True)
+
+    simulation_results = run_simulation(voltage_range, td_values, default_params, diagnostics)
+
+    if diagnostics.enable_plots:
+        plot_results(simulation_results)
